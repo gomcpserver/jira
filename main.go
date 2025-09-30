@@ -17,6 +17,70 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
+// ---- Debug helpers ----
+
+var debug = os.Getenv("DEBUG") == "1"
+
+func init() {
+	// Timestamp + microseconds + short file:line for easier troubleshooting
+	log.SetFlags(log.LstdFlags | log.Lmicroseconds | log.Lshortfile)
+}
+
+func debugf(format string, args ...any) {
+	if debug {
+		log.Printf("[DEBUG] "+format, args...)
+	}
+}
+
+func maskEmail(s string) string {
+	// keep first char and domain, mask the rest: a***@example.com
+	if s == "" || !strings.Contains(s, "@") {
+		return s
+	}
+	parts := strings.SplitN(s, "@", 2)
+	user, dom := parts[0], parts[1]
+	if len(user) <= 1 {
+		return "*@" + dom
+	}
+	return user[:1] + strings.Repeat("*", len(user)-1) + "@" + dom
+}
+
+func tokenInfo(token string) string {
+	// Only return length, never the token content
+	return fmt.Sprintf("len=%d", len(token))
+}
+
+// ---- HTTP logging transport (safe) ----
+
+type loggingTransport struct {
+	base http.RoundTripper
+}
+
+func (t loggingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if debug {
+		// Avoid leaking headers like Authorization
+		debugf("HTTP %s %s", req.Method, req.URL.String())
+	}
+	resp, err := t.base.RoundTrip(req)
+	if debug && resp != nil {
+		debugf("HTTP -> %s", resp.Status)
+	}
+	return resp, err
+}
+
+func wrapClientForDebug(c *http.Client) *http.Client {
+	if !debug {
+		return c
+	}
+	rt := c.Transport
+	if rt == nil {
+		rt = http.DefaultTransport
+	}
+	c2 := *c
+	c2.Transport = loggingTransport{base: rt}
+	return &c2
+}
+
 // ---- Jira client (minimal) ----
 
 type JiraClient struct {
@@ -29,6 +93,13 @@ func NewJiraClientFromEnv() (*JiraClient, error) {
 	baseURL := strings.TrimRight(os.Getenv("JIRA_INSTANCE_URL"), "/")
 	email := os.Getenv("JIRA_USER_EMAIL")
 	token := os.Getenv("JIRA_API_TOKEN")
+
+	if debug {
+		debugf("Load env: JIRA_INSTANCE_URL=%q", baseURL)
+		debugf("Load env: JIRA_USER_EMAIL=%q (masked=%q)", email, maskEmail(email))
+		debugf("Load env: JIRA_API_TOKEN (%s)", tokenInfo(token))
+	}
+
 	if baseURL == "" || email == "" || token == "" {
 		return nil, errors.New("JIRA_INSTANCE_URL, JIRA_USER_EMAIL, JIRA_API_TOKEN must be set")
 	}
@@ -36,10 +107,13 @@ func NewJiraClientFromEnv() (*JiraClient, error) {
 		return nil, fmt.Errorf("invalid JIRA_INSTANCE_URL: %w", err)
 	}
 	auth := "Basic " + base64.StdEncoding.EncodeToString([]byte(email+":"+token))
+	cl := &http.Client{Timeout: 30 * time.Second}
+	cl = wrapClientForDebug(cl)
+
 	return &JiraClient{
 		BaseURL: baseURL,
 		Auth:    auth,
-		Client:  &http.Client{Timeout: 30 * time.Second},
+		Client:  cl,
 	}, nil
 }
 
@@ -49,6 +123,10 @@ func (c *JiraClient) doJSON(ctx context.Context, method, path string, body any, 
 		b, err := json.Marshal(body)
 		if err != nil {
 			return err
+		}
+		if debug {
+			// Body might contain user text; safe to log as JSON if needed
+			debugf("Jira request body: %s", string(b))
 		}
 		r = strings.NewReader(string(b))
 	}
@@ -142,6 +220,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("init error: %v", err)
 	}
+	debugf("Starting MCP server: name=%s version=%s", "jira", "0.1.0")
 
 	server := mcp.NewServer(&mcp.Implementation{
 		Name:    "jira",
@@ -157,14 +236,13 @@ func main() {
 		Title:       "Get Issue",
 		Description: "Get a Jira issue by key",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args getIssueArgs) (*mcp.CallToolResult, any, error) {
+		debugf("tool=get_issue args={key:%q}", args.Key)
 		iss, err := jc.GetIssue(ctx, args.Key)
 		if err != nil {
+			debugf("tool=get_issue error=%v", err)
 			return nil, nil, err
 		}
-		return &mcp.CallToolResult{
-			// If StructuredContent is set, SDK will also provide JSON text when Content is empty.
-			StructuredContent: iss,
-		}, nil, nil
+		return &mcp.CallToolResult{StructuredContent: iss}, nil, nil
 	})
 
 	// search_issues(jql, max_results?)
@@ -177,8 +255,10 @@ func main() {
 		Title:       "Search Issues",
 		Description: "Search Jira with JQL",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args searchArgs) (*mcp.CallToolResult, any, error) {
+		debugf("tool=search_issues args={jql:%q,max:%d}", args.JQL, args.MaxResults)
 		res, err := jc.Search(ctx, args.JQL, args.MaxResults)
 		if err != nil {
+			debugf("tool=search_issues error=%v", err)
 			return nil, nil, err
 		}
 		return &mcp.CallToolResult{StructuredContent: res}, nil, nil
@@ -194,7 +274,13 @@ func main() {
 		Title:       "Add Comment",
 		Description: "Add a comment to a Jira issue",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args addCommentArgs) (*mcp.CallToolResult, any, error) {
+		preview := args.Body
+		if len(preview) > 80 {
+			preview = preview[:80] + "..."
+		}
+		debugf("tool=add_comment args={key:%q, body-preview:%q}", args.Key, preview)
 		if err := jc.AddComment(ctx, args.Key, args.Body); err != nil {
+			debugf("tool=add_comment error=%v", err)
 			return nil, nil, err
 		}
 		return &mcp.CallToolResult{
@@ -214,8 +300,11 @@ func main() {
 		Title:       "Create Issue",
 		Description: "Create a Jira issue",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args createIssueArgs) (*mcp.CallToolResult, any, error) {
+		debugf("tool=create_issue args={project:%q,type:%q,summary:%q,desc-len:%d}",
+			args.ProjectKey, args.IssueType, args.Summary, len(args.Description))
 		iss, err := jc.CreateIssue(ctx, args.ProjectKey, args.IssueType, args.Summary, args.Description)
 		if err != nil {
+			debugf("tool=create_issue error=%v", err)
 			return nil, nil, err
 		}
 		return &mcp.CallToolResult{StructuredContent: iss}, nil, nil
