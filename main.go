@@ -26,14 +26,14 @@ type JiraClient struct {
 }
 
 func NewJiraClientFromEnv() (*JiraClient, error) {
-	baseURL := strings.TrimRight(os.Getenv("JIRA_BASE_URL"), "/")
+	baseURL := strings.TrimRight(os.Getenv("JIRA_INSTANCE_URL"), "/")
 	email := os.Getenv("JIRA_USER_EMAIL")
 	token := os.Getenv("JIRA_API_TOKEN")
 	if baseURL == "" || email == "" || token == "" {
-		return nil, errors.New("JIRA_BASE_URL, JIRA_USER_EMAIL, JIRA_API_TOKEN must be set")
+		return nil, errors.New("JIRA_INSTANCE_URL, JIRA_USER_EMAIL, JIRA_API_TOKEN must be set")
 	}
 	if _, err := url.ParseRequestURI(baseURL); err != nil {
-		return nil, fmt.Errorf("invalid JIRA_BASE_URL: %w", err)
+		return nil, fmt.Errorf("invalid JIRA_INSTANCE_URL: %w", err)
 	}
 	auth := "Basic " + base64.StdEncoding.EncodeToString([]byte(email+":"+token))
 	return &JiraClient{
