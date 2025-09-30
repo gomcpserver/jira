@@ -144,7 +144,7 @@ func main() {
 	}
 
 	server := mcp.NewServer(&mcp.Implementation{
-		Name:    "jira-mcp-go",
+		Name:    "jira",
 		Version: "0.1.0",
 	}, nil)
 
